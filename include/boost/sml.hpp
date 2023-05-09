@@ -1179,6 +1179,10 @@ class sm;
 template <class, class...>
 struct sm_policy;
 struct no_policy;
+template <class TRootSM, class... TSubSMs>
+TRootSM get_root_sm_impl(aux::pool<TRootSM, TSubSMs...> *);
+template <class TSubs>
+using get_root_sm_t = decltype(get_root_sm_impl((TSubs *)0));
 namespace policies {
 struct logger_policy__ {};
 template <class T>
@@ -1356,8 +1360,6 @@ struct sm_impl : aux::conditional_t<aux::is_empty<typename TSM::sm>::value, aux:
   template <class T>
   using defer_queue_t = typename TSM::defer_queue_policy::template rebind<T>;
   using defer_flag_t = typename TSM::defer_queue_policy::flag;
-  template <class T>
-  using process_queue_t = typename TSM::process_queue_policy::template rebind<T>;
   using logger_t = typename TSM::logger_policy::type;
   using dispatch_t = typename TSM::dispatch_policy;
   using transitions_t = decltype(aux::declval<sm_t>().operator()());
@@ -1374,7 +1376,6 @@ struct sm_impl : aux::conditional_t<aux::is_empty<typename TSM::sm>::value, aux:
   using has_unexpected_events = typename aux::is_base_of<unexpected, aux::apply_t<aux::inherit, events_t>>::type;
   using has_entry_exits = typename aux::is_base_of<entry_exit, aux::apply_t<aux::inherit, events_t>>::type;
   using defer_t = defer_queue_t<aux::apply_t<queue_event, events_t>>;
-  using process_t = process_queue_t<aux::apply_t<queue_event, events_t>>;
   using deps = aux::apply_t<merge_deps, transitions_t>;
   using state_t = aux::conditional_t<(aux::size<states_t>::value > 0xFF), unsigned short, aux::byte>;
   static constexpr auto regions = aux::size<initial_states_t>::value;
@@ -1678,7 +1679,6 @@ struct sm_impl : aux::conditional_t<aux::is_empty<typename TSM::sm>::value, aux:
   state_t current_state_[regions]{};
   thread_safety_t thread_safety_{};
   defer_t defer_{};
-  process_t process_{};
   defer_flag_t defer_processing_ = defer_flag_t{};
   defer_flag_t defer_again_ = defer_flag_t{};
   typename defer_t::const_iterator defer_it_{};
@@ -1709,6 +1709,12 @@ class sm {
       aux::apply_t<aux::pool,
                    aux::apply_t<aux::unique_t, aux::join_t<deps, sm_all_t, logger_dep_t, aux::apply_t<merge_deps, sub_sms_t>>>>;
   struct events_ids : aux::apply_t<aux::inherit, events> {};
+  template <class T>
+  using process_queue_t = typename TSM::process_queue_policy::template rebind<T>;
+  using sub_internal_events_t = aux::apply_t<aux::unique_t, aux::apply_t<get_sub_internal_events, transitions_t>>;
+  using events_t = aux::apply_t<aux::unique_t, aux::join_t<sub_internal_events_t, aux::apply_t<get_all_events, transitions_t>>>;
+  using process_t = process_queue_t<aux::apply_t<queue_event, events_t>>;
+  struct mappings : mappings_t<transitions_t> {};
 
  public:
   constexpr sm() : deps_{aux::init{}, aux::pool<>{}}, sub_sms_{aux::pool<>{}} { aux::get<sm_impl<TSM>>(sub_sms_).start(deps_, sub_sms_); }
@@ -1811,6 +1817,38 @@ class sm {
   }
 
  private:
+  template <class TEvent, class TDeps, class TSubs>
+  constexpr bool process_event_impl(const TEvent& event, TDeps& deps, TSubs &subs) {
+    return false;
+  }
+
+  template <class TDeps, class TSubs, class... TEvents>
+  constexpr bool process_queued_events(TDeps &, TSubs &, const aux::type<no_policy>&, const aux::type_list<TEvents...> &) {
+    return false;
+  }
+
+  template <class TDeps, class TSubs, class TEvent>
+  constexpr bool process_event_no_queue(TDeps& deps, TSubs & subs, const void* data) {
+    auto& root_sm = aux::get<get_root_sm_t<TSubs>>(subs);
+    return root_sm.template process_event_no_queue<TDeps, TSubs, TEvent>(deps, subs, data);
+  }
+
+  template <class TDeps, class TSubs, class TProcessQueue, class ... TEvents>
+  bool process_queued_events(TDeps& deps, TSubs& subs, const aux::type<TProcessQueue> &, const aux::type_list<TEvents...> &) {
+    using dispatch_table_t = bool (sm::*)(TDeps &, TSubs &, const void*);
+    const static dispatch_table_t dispatch_table[__BOOST_SML_ZERO_SIZE_ARRAY_CREATE(sizeof...(TEvents))] = {
+      &sm::process_event_no_queue<TDeps, TSubs, TEvents>...
+    };
+    bool wasnt_empty = !process_.empty();
+    while (!process_.empty()) {
+      (this->*dispatch_table[process_.front().id])(deps, subs, process_.front().data);
+            process_.pop_front();
+    }
+    return wasnt_empty;
+  }
+
+ private:
+  process_t process_{};
   deps_t deps_;
   sub_sms_t sub_sms_;
 };
